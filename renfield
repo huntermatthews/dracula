@@ -1,0 +1,289 @@
+#! /usr/bin/python2.6
+
+version = '1.0'
+default_age = 180        # This value should be in days. So 180 = 6 * 30 = 6 months.
+                         # I'd love for this to be more flexible, human friendly but that adds another
+                         # library or 3.
+default_vampire = 'dracula'    # name of the default vampire script
+                               # 'dracula' handles hiseq 2000 and miseq outputs (we believe)
+                               # no path given -  we assume its in your PATH
+
+
+import sys
+if sys.version_info<(2,6,0):
+    # It might work on earlier pythons but I've not tested that.
+    sys.stderr.write("ERROR: You need python 2.6 or later to run this script\n")
+    sys.exit(1)
+
+# import argparse - linux has this packaged nicely but solaris doesn't. So I put the only required file 
+# in with the program. Happily python adds the programs location to the import path, so this should always 
+# work (linux or solaris). 
+import argparse
+import os
+import os.path
+import datetime
+import string
+import subprocess
+
+def get_run_date(run, args):
+    # we need this in both the if and the else clause - do it once 
+    datestamp = datetime.datetime.fromtimestamp(os.path.getmtime(run))
+
+    if not args.date_from_dirname:
+        return datestamp
+    else:
+#        print len(run)
+#        print run[6]
+#        sys.exit()
+        if len(run) < 7 or run[6] != '_':    # must be 6 - thats the first _ if there are any in a run name
+            if args.verbose:
+                print('WARNING: for run {0} there is no "_" at position 6 '
+                      '- ignoring run name parsing'.format(run))
+            return datestamp
+               
+        for i, char in enumerate(run[0:6]):
+            if not char in string.digits:
+                if args.verbose:
+                    print('WARNING: for run {0} character {1} at position {2} is not a valid digit - '
+                          'ignoring run name parsing'.format(run, char, i))
+                return datestamp
+            # there's an '_' at the right place and all the leading chars are digits - assume its a date
+        year = int(run[0:2])
+        month = int(run[2:4])
+        day = int(run[4:6])
+        if args.verbose == 3:
+            print('DEBUG: I think the date part for run {0} breaks down as year {1}, month {2} and day {3}'.format(
+                    run, year, month, day))
+        datestamp = datetime.datetime(year, month, day) 
+        return datestamp
+
+
+def process_cmdline():
+    desc="%(prog)s decides which arguments are sequencer runs _and_ that are old enough to be vampired." \
+        " Optionally feed them to dracula (the default vampire script)."
+    parser = argparse.ArgumentParser(description=desc)
+    parser.add_argument('-V', '--version', action='version', version=version)
+    parser.add_argument("-v", "--verbose", action="count", default=0,
+                        help='Display more and more information (1=warnings, 2=info, 3=debug).')
+    parser.add_argument('--age', default=default_age, type=int,
+                        help='Specify a different age (measured in days) to compare runs against.')
+    parser.add_argument('--defaults', action='store_true', 
+                        help='Print out all the program defaults and exit.')
+    parser.add_argument('-d', '--date-from-dirname', action='store_true',
+                        help='Ignore the filesystem time and attempt to parse the date in the run name.')
+    parser.add_argument('-c', '--check-archive', action='store_true',
+                        help='Check a given archive (found with run name and option --target_dir) for successful'
+                        ' log file completion - should mean no errors. CAUTION =Experimental=.')
+    group = parser.add_argument_group('vampire options')
+    group.add_argument('--vampire', action='store_true',
+                       help='Run the vampire on each valid and sufficiently aged run we find.')
+    group.add_argument('--script', default=default_vampire,
+                       help='Only useful with --vampire - name of vampire script to use.')
+    group.add_argument('-n', '--norun', action='store_true',
+                       help='Only useful with --vampire - instead of running vampire, show command line that would be run.')
+    group.add_argument('-o', '--output_dir', 
+                       help='Only useful with --vampire or --check-archive - give the vampire script the optional output dir.')
+    group.add_argument('--ignore-return-code', action='store_true',
+                       help='Only useful with --vampire - ignore errors from the vampire and keep going.'
+                       'This only looks at the return code of the program - not text errors.')
+    parser.add_argument('runs', nargs=argparse.REMAINDER,
+                        help='None or more runs to analyse - none means everything in the current dir.')
+    args = parser.parse_args()
+
+    if args.verbose == 4:    # this is a hack/ undocumented feature - 4 -v's (and only 4) and we print the args.
+        print(args)
+        sys.exit(1)
+
+    if args.verbose > 3:   # prevent some nut from -vvvvv and wondering where all the output went
+        args.verbose = 3 
+
+    bad_args = False    
+    if args.norun and not args.vampire:
+        print('ERROR: -n or --norun specified without --vampire')
+        bad_args = True
+
+    if args.output_dir and (not args.vampire and  not args.check_archive):
+        print('ERROR: --output_dir specified without --vampire or --check-archive')
+        bad_args = True
+
+    # Can't check for this possibility because we default the script to use
+    # How do we check for default vs user supplied?
+    #if args.script and not args.vampire:
+    #    print('ERROR: --script specified without --vampire')
+    #    bad_args = True
+
+    if args.ignore_return_code and not args.vampire:
+        print('ERROR: --ignore-return-code specified without --vampire')
+        bad_args = True
+
+    if bad_args:
+        sys.exit(2)
+
+    if args.runs == []:   # we got the empty list
+        args.runs = os.listdir(os.getcwd())
+
+    if args.defaults:
+        # all of these must present the variable, the value AND the unit if sensible.
+        # x=90 without saying what 90 IS is useless to a user.
+        print('default_age (unit is days) is {0}.'.format(default_age))
+        print('default_vampire is {0}.'.format(default_vampire))
+        sys.exit(0)
+
+    if args.verbose == 3:
+        print('DEBUG: runs for consideration are: {0}'.format(args.runs))
+
+    return args
+
+
+def get_valid_runs(args):
+
+    valid_runs = []
+    for run in args.runs:
+
+        if not os.path.isdir(run):
+            if args.verbose > 1:
+                print('INFO: {0} is not itself a directory - not a valid run'.format(run))
+            continue
+
+        date_to_check = datetime.datetime.now() - datetime.timedelta(days=args.age)
+        filemtime = get_run_date(run, args)
+
+        if filemtime > date_to_check:   # This compares secs_since_epoch to secs_since_epoch = thus > works
+            if args.verbose > 1:
+                print('INFO: {0} is less than {1} days old'.format(run, args.age))
+            continue
+
+        if not os.path.isdir(os.path.join(run, 'Config')):
+            if args.verbose > 1:
+                print('INFO: {0}/Config does not exist - not a valid run'.format(run))
+            continue
+
+        if not os.path.isdir(os.path.join(run, 'Data')):
+            if args.verbose > 1:
+                print('INFO: {0}/Data does not exist - not a valid run'.format(run))
+            continue
+
+        if args.verbose > 1:
+            print('INFO: {0} is a valid run ready to be vampired (archived)'.format(run))
+
+        valid_runs.append(run)
+
+    valid_runs.sort()    # sort list in place. ignores locale and everything i18n. Bwahhahaha.
+
+    return valid_runs
+
+
+def call_vampire(run, args):
+    # Run the vampire, once per each valid_run
+    cmd = [args.script, ]   # dont add the run yet.
+    if args.norun:
+        cmd.insert(0, 'echo')
+    if args.output_dir:
+        cmd = cmd + ['--output_dir', args.output_dir]
+    # final step, append the run name
+    cmd.append(run)
+    retcode = subprocess.call(cmd)
+    if args.verbose == 3:
+        print ('INFO: return code = {0}'.format(retcode))
+    if (retcode != 0) and not args.ignore_return_code:
+        sys.exit(retcode)
+
+
+def check_run(archive, args):
+    
+    # archive path exists and is dir
+    if not os.path.isdir(archive):
+        if args.verbose > 1:
+            print('INFO: {0} is not itself a directory - not a valid archive'.format(archive))
+        return False
+
+    # archive/dracula.meta exists and is dir
+    path = os.path.join(archive, 'dracula.meta')
+    if not os.path.isdir(path):
+        if args.verbose > 1:
+            print('INFO: {0} does not exist - not a valid archive'.format(path))
+        return False
+
+    # archive/dracula.meta/archive.list exists, is file and is not 0 length
+    path = os.path.join(archive, 'dracula.meta', (archive + '.list'))
+    if not (os.path.isfile(path) and os.stat(path).st_size > 0):
+        if args.verbose > 1:
+            print('INFO: {0} does not exist or zero length - not a valid archive'.format(path))
+        return False
+
+    # archive/dracula.meta/archive.namelist exists, is file and is not 0 length
+    path = os.path.join(archive, 'dracula.meta', (archive + '.namelist'))
+    if not (os.path.isfile(path) and os.stat(path).st_size > 0):
+        if args.verbose > 1:
+            print('INFO: {0} does not exist or zero length - not a valid archive'.format(path))
+        return False
+
+    # archive/dracula.meta/archive.savelist exists, is file and is not 0 length
+    path = os.path.join(archive, 'dracula.meta', (archive + '.savelist'))
+    if not (os.path.isfile(path) and os.stat(path).st_size > 0):
+        if args.verbose > 1:
+            print('INFO: {0} does not exist or zero length - not a valid archive'.format(path))
+        return False
+
+    # archive/dracula.meta/dracula.log exists, is file, is not 0 length 
+    path = os.path.join(archive, 'dracula.meta', 'dracula.log')
+    if not (os.path.isfile(path) and os.stat(path).st_size > 0):
+        if args.verbose > 1:
+            print('INFO: {0} does not exist or zero length - not a valid archive'.format(path))
+        return False
+    else:
+        # Open the dracula.log file for reading and look for the "end_timestamp" text, indicating we 
+        # successfully ended. (Thats not the _last_ line, but its the line best indicating success).
+        log_ok = False
+        with open(path) as log:
+            for line in log:
+                if 'ERROR' in line or 'error' in line:
+                    log_ok = False    # I know this is the default, I don't care
+                    break
+                if 'end_timestamp' in line:
+                    log_ok = True
+                    break
+        if not log_ok:
+            if args.verbose > 1:
+                print('INFO: {0} does not contain log message saying success ("end_timestamp") OR we found an error' \
+                      ' - not a valid archive'.format(path))
+            return False
+
+    if args.verbose > 1:
+        print('INFO: {0} is a valid archive'.format(archive))
+
+    return True
+
+
+def main():
+    
+    args = process_cmdline()
+
+    if args.check_archive:
+        for archive in args.runs:    # runs is really "archives" here
+            if check_run(archive, args):
+                print('{0} is a valid archive'.format(archive))
+            else:
+                print('{0} is NOT a valid archive'.format(archive))
+                
+    else:
+        valid_runs = get_valid_runs(args)
+
+        if args.verbose > 1 and not args.vampire:
+            print('\nINFO: Valid runs ready to be vampired (archived) are:')
+
+        for run in valid_runs:
+            if args.vampire:
+                call_vampire(run, args)
+            else:
+                print(run)
+
+
+if __name__ == '__main__':
+    main() 
+
+       
+## END OF LINE ##
+# Local Variables:
+# mode: python
+# End:

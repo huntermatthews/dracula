@@ -1,0 +1,622 @@
+#! /bin/bash
+
+# Global constants
+VERSION=3.0.beta.1
+PROG_NAME=$(basename $0)
+
+# Global variables (its a shell script - shut up)
+verbose=0
+output_dir=DEFAULT
+cmdline_dump=0
+type_onlly=0
+
+
+display_help()
+{
+    # text modeled after what we get from argparse in python land.
+    cat <<EOF 
+usage: $PROG_NAME [-h] [-V] run_name
+
+$PROG_NAME archives the useful data and meta data from a single sequencer run.
+
+positional argument:
+  run                  A single run is specified to archive or check.
+                       This must be a subdir of the current working directory - 
+                         complex (or even simple) pathing is NOT supported.
+
+options arguments:
+  -h, --help           Show this help message and exit.
+  -V, --version        Show the programs version number and exit.
+  -t, --type_only      Show the probed sequencer type for a run and exit.
+  -o, --output_dir     Specifiy the directory to create the archive in.
+                       Archive is always output_dir/run_name.
+  -X                   Dump out the program config and exit. 
+                       Only useful for command line debugging.
+                       
+EOF
+}
+
+
+### 
+# The meta data file (concept) is from a MUCH older script
+# Its a logging function
+###
+meta_data() 
+{
+    echo "$1" | tee --append $metadata_file
+}
+
+
+get_sequencer_type()
+{
+    type="unknown"
+    
+    # each sequencer (and many of the versions of their software)
+    # have their own idiosyncrasies. What we really care about is how 
+    # important a given class of file is for a given sequencer type.
+    # 
+    # IE, xrayfoobar.xml missing might be a major problem for a 454 run
+    # but completely irrelevant for miseq runs.
+    #
+    # Method: Probe the filesystem looking for interesting files/contents.
+    
+    # The RTA config file is the "best" indicator of illumina and hiseq vs miseq.
+    # Unfortunately, its not always THERE. #$!%^!$%
+    RTAfile="$run_dir/Data/Intensities/RTAConfiguration.xml"
+    if [ -f $RTAfile ] ; then
+        # Its illumina of some sort - either hiseq or miseq
+        type=$(grep -i InstrumentType $RTAfile |\
+               sed -e 's,.*<InstrumentType>\([^<]*\)</InstrumentType>.*,\1,g' |\
+               tr '[:upper:]' '[:lower:]')
+        if [ "$type" != "hiseq" -a "$type" != "miseq" ] ; then
+            echo "ERROR: found Illumina run but can not determine hiseq vs miseq. type=$type" 
+            exit 1
+        fi
+    elif [[ "$run_name" =~ [0-9]{6}_M02149_.* ]] ; then
+	# its our newer miseq
+	type="miseq"
+    elif [[ "$run_name" =~ [0-9]{6}_M00365_.* ]] ; then
+	# loaner miseq while they debated who got to shoot the cryseq
+	type="miseq"
+    elif [[ "$run_name" =~ [0-9]{6}_M00176_.* ]] ; then
+	# its our older miseq, the infamous "cryseq" 
+	type="miseq"
+    elif [[ "$run_name" =~ [0-9]{6}_SN1035_.* ]] ; then
+	# its our hiseq 2000
+	type="hiseq"
+#    elif [[ "$run_name" =~ [RD]_[0-9]{4}_[0-9]{2}_[0-9]{2}_[0-9]{2}_[0-9]{2}_[0-9]{2}_FLX10070265.* ]] ; then
+    elif [[ "$run_name" =~ .*FLX10070265.* ]] ; then
+        # 454 runs are weird 
+        type="454"
+    elif [[ "$run_name" =~ .*HGAC.* || "$run_name" =~ .*HWI.* ]] ; then
+	# These are the old GAIIx sequencer output.
+	type=gaiix
+    fi
+
+    echo $type
+}
+
+
+condense_hiseq()
+{
+    echo "Hi. I'm the hiseq condenser function!"
+    echo "Bye!"
+}    
+
+
+condense_miseq()
+{
+    echo "Hi. I'm the miseq condenser function!"
+    echo "I might just call my brother, the hiseq condenser function"
+    echo "Bye!"
+}    
+
+
+copy_files()
+{
+    # function given a list of grep expressions
+    #    greps namelist into little savelist (regular, gzip, tar)
+    #    sorts and uniqs the the little savelist
+    #    xargs (or something) the little savelist to cp/gzip/tar
+    #       tar doesn't need xargs - just use tar
+    #       cp code exists
+    #       gzip will be - difficult
+    #           we can cp then gzip (two loops, read files twice, write files 1.5x times
+    #           OR do some path/mkdir magic and gzip with std.out to target.
+    #    append the little savelist to the master savelist.
+
+    # we need our own list to be appended to the master savelist later.
+    tmplist=${savelist}.copied
+    if [ -f $tmplist ] ; then
+	meta_data "ERROR: $PROG_NAME:copy_files() called more than once. Internal programming error."
+	exit 1
+    fi
+
+    for expr in "$@" ; do
+        grep_list="$grep_list -e '$expr'"
+    done
+    grep_cmd="grep --ignore-case $grep_list $namelist >> $tmplist"
+    eval $grep_cmd  
+
+    #echo "*** tmplist BEGIN ***"
+    cat $tmplist | sort | uniq > $tmplist.tmp 
+    mv $tmplist.tmp $tmplist
+    #cat $tmplist
+    #echo "*** tmplist END ***"
+
+    ### 
+    # Now that we have a list, copy all the file to be saved to the _output_ dir
+    # (The tmplist has the run name in it, so this avoids a subdir of a subdir kind of thing)
+    # We use xargs here because of, again, strange filenames (spaces and #'s and @'s and god help us).
+    ###
+    meta_data "Copying important files. This may take a while..."
+    xargs -a $tmplist cp -d --preserve=all --parents -t $output_dir
+    if [ $? != 0 ] ; then
+	meta_data "ERROR: Copy of files failed - can not continue"
+	meta_data "ERROR: Exiting"
+	exit $?
+    else
+	cat $tmplist >> $savelist
+    fi
+}
+
+
+gzip_files()
+{
+    # Aside: I looked at (and started coding) to do this in one step via using gzip and standard out.
+    # But that requires:
+    #    getting the target dirs pre-created (gzip -c can't do that for you)
+    #    gzip the file to the newly created target
+    # But doing that _with_xargs_ got really hairy really fast.
+    #    Why insist on xargs? we're using that to hide spaces in filenames / dirnames problems.
+
+    # we need our own list to be appended to the master savelist later.
+    tmplist=${savelist}.gzipd
+    if [ -f $tmplist ] ; then
+	meta_data "ERROR: $PROG_NAME:gzip_files() called more than once. Internal programming error."
+	exit 1
+    fi
+
+    for expr in "$@" ; do
+        grep_list="$grep_list -e '$expr'"
+    done
+    grep_cmd="grep --ignore-case $grep_list $namelist >> $tmplist"
+    eval $grep_cmd  
+
+    #echo "*** tmplist BEGIN ***"
+    cat $tmplist | sort | uniq > $tmplist.tmp 
+    mv $tmplist.tmp $tmplist
+    #cat $tmplist
+    #echo "*** tmplist END ***"
+
+    ### 
+    # Now that we have a list, copy all the file to be saved to the _output_ dir
+    # (The tmplist has the run name in it, so this avoids a subdir of a subdir kind of thing)
+    # We use xargs here because of, again, strange filenames (spaces and #'s and @'s and god help us).
+    ###
+    meta_data "Copying and Gziping important files. This will take a while..."
+    xargs -a $tmplist cp -d --preserve=all --parents -t $output_dir
+    if [ $? != 0 ] ; then
+	meta_data "ERROR: Copy of files failed - can not continue"
+	meta_data "ERROR: Exiting"
+	exit $?
+    fi
+
+    xargs -a $tmplist -I{} gzip $output_dir/{}
+    if [ $? != 0 ] ; then
+	meta_data "ERROR: Gzip of files failed - can not continue"
+	meta_data "ERROR: Exiting"
+	exit $?
+    else
+	cat $tmplist >> $savelist
+    fi
+
+    echo "HERE HERE HERE"
+    exit 100
+
+}
+
+
+condense_454()
+{
+    ###
+    # Call the generic pre function - get our logging going and the filelist and namelist
+    ###
+    condense_generic_prelude
+    if [ $? != 0 ] ; then
+	# Due to the RULE (see comment in condense_generic_prelude) we know meta_data is safe here.
+	meta_data "ERROR: internal error in $PROG_NAME::condense_generic_prelude(). Previous errors should show the problem."
+	exit 1
+    fi
+
+    ###
+    ## THINGS TO KEEP:   (in order of importance) 
+    # I got this list from Dion in April of 2014.
+    # sff files   (454 propreitary binary format gene sequences)
+    # fna files   (less proprietary text format gene seqs)
+    # qual files  (less proprietary text format quality scores)
+    # csv files   (sarah insisted we keep these - I surrendered because they're small)
+    #
+    # THINGS THAT SHOULD BE THERE BUT AREN'T
+    # logs - There are no logs in 454 runs (what the hell?)
+    #
+    ## THINGS TO TOSS:
+    # none of the txt files look useful   (perl data structures?)
+    # no equivalent of Illumina sample sheets found 
+    # none of the "top level" directory files seem important.
+    # everything else 
+    ### 
+
+    gzip_files "\.fna$" "\.sff$" "\.qual$" 
+    copy_files "\.csv$"
+
+    ###
+    # Call the generic post function
+    ###
+    condense_generic_postscript
+    if [ $? != 0 ] ; then
+	meta_data "ERROR: internal error in $PROG_NAME::condense_generic_postscript(). Previous errors should show the problem."
+	exit 1
+    fi
+
+}
+
+
+condense_gaiix()
+{
+    echo "ERROR: GAIIx condensing not implemented."
+    echo "All the gaiix runs _should_ have already been condensed by now obsolete scripts."
+    echo "So dracula (ironically derived from those scripts) no longer support gaiix."
+    echo "Sorry."
+    return 1
+}
+
+
+fake_condense_hiseq()
+{
+    ###
+    # Find what we should be keeping
+    #
+    ## THINGS TO KEEP:   (in order of importance)
+    # All fastq files everywhere
+    # Logs  - Keep
+    # nohup.txt - anywhere -- its basically a log of what casava did
+    # Demultiplex_Stats - anywhere
+    # unaligned*/Basecall_Stats* - anywhere (once per unaligned dir, basically)
+    # InterOp - keep
+    # any files at the top of the run
+    # Hunter added SampleSheet.csv - anywhere (in case they dumped it somewhere other than at the top)
+    ## THINGS TO TOSS:
+    # Config - not useful
+    # Images - not useful, probably doesn't exist
+    # Thumbnail_Images - not useful
+    # Data - not useful EXCEPT the fastq files themselves
+    ### 
+
+    # Grep whatever we can
+    meta_data "Figuring out what to condense (archive/preserve) out of the run..."
+    grep --ignore-case \
+	-e "fastq" \
+	-e "nohup" \
+	-e "Demultiplex_Stats" \
+	-e "Basecall_Stats" \
+	-e "SampleSheet" \
+	-e "csv$" \
+	-e "InterOp" \
+	$namelist >> $savelist
+
+    # We need to grep and test here for the top level "stuff" the lab techs like to keep around.
+    for file in $(grep -E -e "$run_name/[^/]*$" $namelist) ; do 
+	if [ -f $file ] ; then
+	    echo $file >> $savelist
+	fi
+    done
+
+    #echo "*** SAVELIST BEGIN ***"
+    cat $savelist | sort | uniq > $savelist.tmp 
+    mv $savelist.tmp $savelist
+    #cat $savelist
+    #echo "*** SAVELIST END ***"
+
+    ### 
+    # Now that we have a list, copy all the file to be saved to the _output_ dir
+    # (The savelist has the run name in it, so this avoids a subdir of a subdir kind of thing)
+    # We use xargs here because of, again, strange filenames (spaces and whatnot).
+    ###
+    meta_data "Archiving important files. This may take a while..."
+    xargs -a $savelist cp -d --preserve=all --parents -t $output_dir
+    if [ $? != 0 ] ; then
+	meta_data "ERROR: Copy of non Log files failed - can not continue"
+	meta_data "ERROR: Exiting"
+	exit $?
+    fi
+
+    ###
+    # Logs are deep and silly - and I doubt they are referenced much really
+    # So, we special case them as a tar ball
+    ###
+    meta_data "Grabbing the logs as a last step..."
+    tar czf $target_dir/Logs.tgz $run_dir/Logs
+    if [ $? != 0 ] ; then
+	meta_data "ERROR: Copy of Log files failed - can not continue"
+	meta_data "ERROR: Exiting"
+	exit $?
+    fi
+
+    ###
+    # Now that we've done the Logs (possibly), fake append that part of the tree
+    # to the savelist. (we saved them as a tar, not as a copy - but we saved them).
+    # This has GOT to match the filename used in the tar above.
+    ###
+    # FIXME: to be more accurate - don't grep, tar tzf the tarball - it'll be somewhat smallish.
+    grep --ignore-case \
+	-e "$run_dir/Logs" \
+	$namelist >> $savelist
+}
+
+
+condense_generic_prelude()
+{
+    ###
+    # Start the condensing / archiving process
+    # 
+    # This code should all be generic - not specific to any sequencer type.
+    ###
+
+    # Test for existance of run dir IN PWD - pathing is just too hard to get right
+    # dracula must be run from the directory that contains the run.
+    if [ ! -d "$PWD/$run_name" ] ; then    # the quotes here are critical - bug fix
+	echo "ERROR: source dir \"$run_name\" does not exist (or is not a directory, or is not a subdir)"
+	exit 1
+    fi
+
+    # Test for pre-existing target dir (probably an error)
+    # WARNING: meta_data _appends_ to the log file - always.
+    # we need a new log file each time or chaos - or we loose an old log or something.
+    # Thus the requirement for a "new" target_dir and meta_dir
+    if [ -d $target_dir ] ; then
+	echo "ERROR: target dir \"$target_dir\" already exists"
+	exit 1
+    else
+	mkdir -p $target_dir $meta_dir
+    fi
+
+    #####################################################################################
+    # RULE: if we are to "error out" before meta_data() can be called, we must exit - otherwise
+    # the calling code that catches the error won't know how to report the error.
+    #####################################################################################
+
+    ###
+    # Record when/where we did all this. I don't know why but whatever. 
+    # (It is now safe and sensible to use meta_data log function)
+    ###
+    meta_data "# $PROG_NAME v$VERSION" 
+    meta_data ""
+    meta_data "start_timestamp = $(date)"
+    meta_data "running on = $HOSTNAME"
+    meta_data "detected sequencer type = $sequencer_type"
+
+    ### 
+    # Record a catalog (listing) of what was originally in the run
+    # This will record 0 length sequence files, and other delusions
+    # only look for files - skips the empty directories 
+    ###
+    meta_data "Gathering information about the run..."
+    listfile=$meta_dir/dracula.fulllist
+    # FIXME: we don' check for errors from find
+    find $run_dir -type f -ls > $listfile
+    meta_data "listing = $listfile"
+
+    ###
+    # Get just the filenames from the listfile (we _really_ only want to walk/find 
+    #   the filesystem once.
+    # This is way trickier than it would first appear - spaces, uneven field counts, etc.
+    # It came to me that each filename always begins with the run (folder) name.
+    # So we use sed to strip everthing before that - regardless of what that everything was.
+    # The Logs entries include the run name themselves - so you get:
+    # junk stuff other bits ${run_name}/Logs/${run_name}_Cyclemumble_mumble.log
+    ###
+    namelist=${meta_dir}/dracula.namelist
+    # FIXME: we don' check for errors from sed
+    sed -r -e "s|[^/]*|$run_name|" $listfile  > $namelist
+    meta_data "filename listing = $namelist"
+
+    ###
+    # This file is what we intend to save
+    # Its basically the final concatenated output of the greps and whatnot below.
+    ###
+    savelist=${meta_dir}/dracula.savelist
+    meta_data "files to save listing = $savelist"
+}
+
+
+condense_generic_postscript()
+{
+    ###
+    # Finish out the condensing / archiving process
+    # 
+    # This code should all be generic - not specific to any sequencer type.
+    ###
+    
+    ###
+    # Record space savings
+    ###
+    meta_data "Space savings summary (approximate):"
+    # FIXME: catch error if any from awk
+    run_size=$(awk 'BEGIN { totalAmount = "0" }
+                          { totalAmount = totalAmount + $7 }
+                    END { split("B KB MB GB TB PB",type)
+                          for(i=5;y < 1;i--)
+                              y = totalAmount / (2**(10*i))
+                          print y type[i+2]
+                  }' $listfile) 
+    
+    meta_data "Run Folder: $run_size"
+
+    # you have to call sync here - I'm gettin 40k on occasion without it
+    # gotta love opensolaris/openindiana
+    sync 
+
+    #echo target_dir = $target_dir $(du -hs $target_dir)
+    meta_data "Condensed Folder: $(du -hs $target_dir | cut -f1 )"
+    
+    ### 
+    # Record completion
+    ###
+    # CAUTION: renfield looks for "end_timestamp" in the dracula.log file for 
+    # good/bad completion. If you change next line, you must update renfield.
+    meta_data "end_timestamp = $(date)"
+    meta_data ""
+    meta_data "## END OF LINE ##"
+
+    return 0
+}
+
+
+get_configuration()
+{
+    ###
+    # parse the command line 
+    ###
+    while :
+    do
+	# By keeping options in alphabetical order, it's easy to add more.
+	case "$1" in
+            -h | --help)
+		display_help  # Call your function
+		# no shifting needed here, we're done.
+		exit 0
+		;;
+            -o | --output_dir)
+		output_dir="$2" 
+		shift 2
+		;;
+	    -t | --type_only)
+		type_only=1
+		shift
+		;;
+            # -v | --verbose)
+            #     verbose=$(($verbose + 1))
+            #     shift
+            #     ;;
+	    -V | --version)
+		echo $VERSION
+		exit 0
+		;;
+	    -X)
+		cmdline_dump=1
+		shift
+		;;
+            --) # End of all options
+		echo 'double dash end of options processing'
+		shift
+		break
+		;;
+            -*)
+		echo "Error: Unknown option: $1" >&2
+		exit 1
+		;;
+            *)  # No more options
+		args="$@"        # not sure what to do here - only one run is supported, but may have spaces?
+		break
+		;;
+	esac
+    done
+
+    ###
+    # Figure out the rest of our configuration
+    # This is program (dracula) centric and unrelated to sequencer type
+    ###
+
+    # The run_dir (a single run of the sequencer) 
+    # This is a single sequencer run. 
+    # Due to multiplexing, it might contain MANY peoples data.
+# FIXME: this is prone to trailing slashes and other bugs
+# make the change and then retest (the testing bit is why this is commented out right now)
+# Change to run_name=$(basename $args)
+#           dir_name=$(dirname $args)
+#           run_dir=$dir_name/$run_name
+    run_dir=$args
+    run_name=$(basename "$run_dir")
+
+    # directory to put the archived runs into
+    if [ $output_dir == "DEFAULT" ]; then
+	output_dir=$(dirname "$run_dir")/condensed_runs
+    fi
+    export output_dir 
+
+    # directory to actually put stuff into.
+    target_dir="$output_dir/$run_name"
+    export target_dir
+
+    # Based on the target dir, figure out where the logs and other
+    # dracula meta data goes.
+    meta_dir=$target_dir/dracula.meta
+    metadata_file=${meta_dir}/dracula.log
+
+    # Yes, this makes me feel dirty
+    pointer() { eval echo \$$1 ;}
+    dump() {  echo "$1 = $(pointer $1)" ;}
+    if [ $cmdline_dump = 1 ] ; then
+	dump run_dir 
+	dump run_name
+	dump output_dir
+	dump target_dir
+	dump verbose
+	dump args
+	dump meta_dir
+
+	exit 0
+    fi
+}
+
+
+##################################################################################################
+# MAIN()
+##################################################################################################
+
+###
+# What are we supposed to do? parse our command line 
+get_configuration "$@"
+
+### 
+# Figure out what brand of crazy we are dealing with
+# IE, what is the sequencer type that produced this run.
+###
+sequencer_type=$(get_sequencer_type)
+if [ "$type_only" == "1" ] ; then
+        echo "$run_name is of type '$sequencer_type'"
+        exit
+fi
+
+
+###
+# Do something appropriate for the sequencer type we are dealing with
+# Something thats an error for one type might be irrelvant for another type.
+###
+case $sequencer_type in 
+    hiseq)
+	condense_hiseq
+	rc=$?
+	;;
+    miseq)
+	condense_miseq
+	rc=$?
+	;;
+    454)
+	condense_454
+	rc=$?
+	;;
+    gaiix)
+	condense_gaiix
+	rc=$?
+	;;
+    *)
+        echo "ERROR: sequence_type '$sequencer_type' for dir '$run_name' not recognized. Fatal"
+	exit 1
+	;;
+esac
+
+exit $rc
+
+## END OF LINE ##
